@@ -1,6 +1,6 @@
 {
   "api_key": "",
-  "base_url": "",
+  "api_url": "https://api.openai.com/v1/chat/completions",
   "model": "gpt-4o-mini",
   "buffer_size": 10000
 }
