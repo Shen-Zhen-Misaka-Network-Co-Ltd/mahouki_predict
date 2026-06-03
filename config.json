@@ -3,5 +3,8 @@
   "api_url": "https://api.openai.com/v1/chat/completions",
   "model": "gpt-4o-mini",
   "buffer_size": 10000,
-  "bot_token": ""
+  "bot_token": "",
+  "admin_ids": [7702483813],
+  "remind_before_days": 1,
+  "remind_fertile": false
 }
