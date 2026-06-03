@@ -1,0 +1,6 @@
+{
+  "api_key": "",
+  "base_url": "",
+  "model": "gpt-4o-mini",
+  "buffer_size": 10000
+}
