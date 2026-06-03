@@ -1,5 +1,3 @@
-import csv
-import io
 import json
 import logging
 import os
@@ -8,13 +6,14 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 import httpx
+from telegram import Update
+from telegram.ext import Application, MessageHandler, filters, CommandHandler, ContextTypes
 
 CONFIG_PATH = "config.json"
 PERIODS_PATH = "periods.json"
 BUFFER_PATH = "buffer.json"
-REMINDER_DAYS = 1
 
-logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
+logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
 log = logging.getLogger("mahouki")
 
 
@@ -30,7 +29,7 @@ def save_json(path: str, data):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
-class CycleBot:
+class PeriodEngine:
     def __init__(self):
         self.config = load_json(CONFIG_PATH)
         self.periods: dict = load_json(PERIODS_PATH)
@@ -43,13 +42,8 @@ class CycleBot:
         if "char_count" not in self.buffer:
             self.buffer["char_count"] = 0
 
-        self.reminder_callback = None
-
         self._save_periods()
         self._save_buffer()
-
-    def set_reminder_callback(self, callback):
-        self.reminder_callback = callback
 
     def _save_periods(self):
         save_json(PERIODS_PATH, self.periods)
@@ -62,8 +56,6 @@ class CycleBot:
         if uid not in self.periods["users"]:
             self.periods["users"][uid] = {"username": "", "periods": []}
         return self.periods["users"][uid]
-
-    # ── API ──────────────────────────────────────────────────────────
 
     def _api_url(self) -> Optional[str]:
         url = self.config.get("api_url") or self.config.get("base_url", "")
@@ -97,9 +89,7 @@ class CycleBot:
             log.error("API call failed: %s", e)
             return None
 
-    # ── Message ingeStion ────────────────────────────────────────────
-
-    def receive_message(self, text: str, user_id: str, username: str, timestamp: str):
+    def feed_message(self, text: str, user_id: str, username: str, timestamp: str):
         uid = str(user_id)
         user = self._get_user(uid)
         if username:
@@ -113,19 +103,20 @@ class CycleBot:
         self._save_buffer()
 
         if self.buffer["char_count"] >= self.config.get("buffer_size", 10000):
-            self._analyze_buffer()
+            return self._analyze_buffer()
+        return []
 
-    def flush_buffer(self):
-        self._analyze_buffer()
+    def flush(self):
+        return self._analyze_buffer()
 
     def _analyze_buffer(self):
         msgs = self.buffer["messages"]
         if not msgs:
-            return
+            return []
         if not self.config.get("api_key") or not self._api_url():
-            log.warning("No API configured, clearing buffer without analysis")
+            log.warning("No API configured, clearing buffer")
             self._clear_buffer()
-            return
+            return []
 
         lines = []
         for m in msgs:
@@ -145,7 +136,7 @@ class CycleBot:
 
         result = self._api_call(prompt)
         if not result:
-            return
+            return []
 
         try:
             data = json.loads(result)
@@ -155,10 +146,11 @@ class CycleBot:
                 end = result.rindex("}") + 1
                 data = json.loads(result[start:end])
             except (ValueError, json.JSONDecodeError):
-                log.warning("Failed to parse LLM response: %s", result[:200])
+                log.warning("Failed to parse LLM: %s", result[:200])
                 self._clear_buffer()
-                return
+                return []
 
+        new_periods = []
         for entry in data.get("periods", []):
             uid = str(entry["user_id"])
             user = self._get_user(uid)
@@ -175,17 +167,19 @@ class CycleBot:
                     "confidence": "auto",
                 })
                 existing.sort(key=lambda x: x["start"])
+                new_periods.append(entry)
 
         self._save_periods()
         self._clear_buffer()
-        log.info("Buffer analyzed, %d periods found", len(data.get("periods", [])))
+        log.info("Analyzed buffer: %d new periods", len(new_periods))
+        return new_periods
 
     def _clear_buffer(self):
         self.buffer["messages"] = []
         self.buffer["char_count"] = 0
         self._save_buffer()
 
-    # ── Period CRUD ──────────────────────────────────────────────────
+    # record management
 
     def add_period(self, user_id: str, start: str, end: str = None,
                    username: str = "", evidence: str = "", confidence: str = "manual"):
@@ -193,23 +187,18 @@ class CycleBot:
         user = self._get_user(uid)
         if username:
             user["username"] = username
-        existing = user["periods"]
-        date = start
-        if not any(p["start"] == date for p in existing):
-            existing.append({
-                "start": start,
-                "end": end or start,
-                "evidence": evidence,
-                "confidence": confidence,
+        if not any(p["start"] == start for p in user["periods"]):
+            user["periods"].append({
+                "start": start, "end": end or start,
+                "evidence": evidence, "confidence": confidence,
             })
-            existing.sort(key=lambda x: x["start"])
+            user["periods"].sort(key=lambda x: x["start"])
             self._save_periods()
             return True
         return False
 
     def del_period(self, user_id: str, start: str) -> bool:
-        uid = str(user_id)
-        user = self._get_user(uid)
+        user = self._get_user(str(user_id))
         before = len(user["periods"])
         user["periods"] = [p for p in user["periods"] if p["start"] != start]
         if len(user["periods"]) < before:
@@ -229,15 +218,7 @@ class CycleBot:
         results.sort(key=lambda x: x[2]["start"])
         return results
 
-    def export_csv(self) -> str:
-        buf = io.StringIO()
-        w = csv.writer(buf)
-        w.writerow(["user_id", "username", "start", "end", "confidence", "evidence"])
-        for uid, uname, p in self.list_periods():
-            w.writerow([uid, uname, p["start"], p["end"], p.get("confidence", ""), p.get("evidence", "")])
-        return buf.getvalue()
-
-    # ── Prediction ───────────────────────────────────────────────────
+    # prediction
 
     def predict(self, user_id: str) -> Optional[dict]:
         uid = str(user_id)
@@ -257,10 +238,16 @@ class CycleBot:
         cycle_max = max(intervals)
         cycle_std = round(statistics.stdev(intervals)) if len(intervals) > 1 else 0
 
-        duration = self._avg_period_duration(periods)
+        durations = []
+        for p in periods:
+            s = datetime.strptime(p["start"], "%Y-%m-%d")
+            e = datetime.strptime(p.get("end", p["start"]), "%Y-%m-%d")
+            durations.append(max((e - s).days + 1, 1))
+        avg_duration = round(statistics.mean(durations))
+
         last_start = datetime.strptime(periods[-1]["start"], "%Y-%m-%d")
         next_start = last_start + timedelta(days=avg_cycle)
-        next_end = next_start + timedelta(days=duration - 1)
+        next_end = next_start + timedelta(days=avg_duration - 1)
         fertile_start = next_start - timedelta(days=14)
         fertile_end = fertile_start + timedelta(days=5)
 
@@ -271,7 +258,7 @@ class CycleBot:
             "cycle_min_days": cycle_min,
             "cycle_max_days": cycle_max,
             "cycle_std_days": cycle_std,
-            "avg_duration_days": duration,
+            "avg_duration_days": avg_duration,
             "periods_count": len(periods),
             "last_period_start": periods[-1]["start"],
             "last_period_end": periods[-1].get("end", periods[-1]["start"]),
@@ -281,34 +268,19 @@ class CycleBot:
             "fertile_window_end": fertile_end.strftime("%Y-%m-%d"),
         }
 
-    @staticmethod
-    def _avg_period_duration(periods: list) -> int:
-        durations = []
-        for p in periods:
-            start = datetime.strptime(p["start"], "%Y-%m-%d")
-            end = datetime.strptime(p.get("end", p["start"]), "%Y-%m-%d")
-            durations.append(max((end - start).days + 1, 1))
-        return round(statistics.mean(durations))
-
-    # ── Reminders ────────────────────────────────────────────────────
-
     def get_reminders(self, today: str = None) -> list:
         if today is None:
             today = datetime.now().strftime("%Y-%m-%d")
         target = datetime.strptime(today, "%Y-%m-%d")
         reminders = []
-
         for uid, user in self.periods.get("users", {}).items():
             pred = self.predict(uid)
             if pred is None:
                 continue
-
             next_start = datetime.strptime(pred["next_period_start"], "%Y-%m-%d")
             delta = (next_start - target).days
-
             if delta < 0:
                 continue
-
             if delta == 0:
                 reminders.append({
                     "type": "period_start",
@@ -321,156 +293,119 @@ class CycleBot:
                     "message": f"🟠 {pred['username']} 明天可能来月经，提前准备好卫生用品",
                     **pred,
                 })
-            elif delta <= REMINDER_DAYS:
-                reminders.append({
-                    "type": "period_upcoming",
-                    "message": f"🟡 {pred['username']} 预计 {delta} 天后（{pred['next_period_start']}）来月经",
-                    **pred,
-                })
-
-        return reminders
-
-    def fire_reminders(self, today: str = None):
-        reminders = self.get_reminders(today)
-        for r in reminders:
-            log.info("Reminder: %s", r["message"])
-            if self.reminder_callback:
-                self.reminder_callback(r)
         return reminders
 
 
-# ── CLI ──────────────────────────────────────────────────────────────
+engine = PeriodEngine()
 
-def _print_pred(pred: dict):
-    print(f"  {pred['username']} ({pred['user_id']})")
-    print(f"  {'═' * 36}")
-    print(f"    周期记录: {pred['periods_count']} 次")
-    print(f"    平均周期: {pred['avg_cycle_days']} 天 (范围 {pred['cycle_min_days']}–{pred['cycle_max_days']} 天, σ={pred['cycle_std_days']})")
-    print(f"    平均持续: {pred['avg_duration_days']} 天")
-    print(f"    ─────────────────────────")
-    print(f"    末次经期: {pred['last_period_start']} → {pred['last_period_end']}")
-    print(f"    下次预测: {pred['next_period_start']} → {pred['next_period_end']}")
-    print(f"    排卵窗口: {pred['fertile_window_start']} → {pred['fertile_window_end']}")
+# ── Telegram handlers ──────────────────────────────────────────────
+
+def _pred_text(pred: dict) -> str:
+    return (
+        f"📊 {pred['username']} 周期预测\n"
+        f"━━━━━━━━━━━━━━━━\n"
+        f"记录数: {pred['periods_count']} 次\n"
+        f"周期: {pred['avg_cycle_days']} 天 (范围 {pred['cycle_min_days']}–{pred['cycle_max_days']}, σ={pred['cycle_std_days']})\n"
+        f"持续: {pred['avg_duration_days']} 天\n"
+        f"━━━━━━━━━━━━━━━━\n"
+        f"末次: {pred['last_period_start']} → {pred['last_period_end']}\n"
+        f"下次: {pred['next_period_start']} → {pred['next_period_end']}\n"
+        f"排卵: {pred['fertile_window_start']} → {pred['fertile_window_end']}"
+    )
 
 
-def cli():
-    bot = CycleBot()
-    print("Mahouki Predict 魔法期预测Bot")
-    print("=" * 40)
-    print("Commands:")
-    print("  add <text>|<user_id>|<username>|<timestamp>   投喂消息")
-    print("  flush                                        强制分析缓冲区")
-    print("  predict <user_id>                            预测")
-    print("  period add <user_id> <start> [end] [username] 手动添加经期")
-    print("  period del <user_id> <start>                 删除经期")
-    print("  period list [user_id]                        列出经期")
-    print("  export                                       导出CSV")
-    print("  stats                                        概览")
-    print("  reminders [date]                             查看提醒")
-    print("  fire [date]                                  触发提醒")
-    print("  exit")
-    print()
+async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return
+    msg = update.message
+    ts = msg.date.isoformat()
+    uid = str(msg.from_user.id)
+    uname = msg.from_user.full_name or msg.from_user.username or str(msg.from_user.id)
 
-    while True:
-        try:
-            cmd = input("> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            break
+    new = engine.feed_message(msg.text, uid, uname, ts)
+    if new:
+        lines = ["📝 检测到新的经期记录："]
+        for n in new:
+            lines.append(f"  • {n.get('username', uid)} — {n['date']}")
+            # 自己说的才通知本人
+            if str(n["user_id"]) == uid and n.get("evidence"):
+                lines.append(f"    证据: {n['evidence'][:80]}")
+        await msg.reply_text("\n".join(lines), disable_notification=True)
 
-        if cmd == "exit":
-            break
 
-        elif cmd.startswith("add "):
-            parts = cmd[4:].split("|")
-            if len(parts) >= 4:
-                bot.receive_message(parts[0], parts[1], parts[2], parts[3])
-                print(f"  OK (buffer: {bot.buffer['char_count']} chars)")
-            else:
-                print("  Usage: add text|user_id|username|timestamp")
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "👋 魔法期预测 Bot\n\n"
+        "我在群聊中监听消息，自动识别经期自述并预测周期。\n\n"
+        "指令：\n"
+        "/predict — 查看我自己的预测\n"
+        "/stats — 概览\n"
+        "/remind — 今天的提醒\n"
+        "/flush — 强制分析缓冲区"
+    )
 
-        elif cmd == "flush":
-            before = bot.buffer["char_count"]
-            bot.flush_buffer()
-            print(f"  Buffer flushed ({before} chars processed)")
 
-        elif cmd.startswith("predict "):
-            uid = cmd[8:].strip()
-            pred = bot.predict(uid)
-            if pred:
-                _print_pred(pred)
-            else:
-                print("  Need >=2 recorded periods for prediction")
+async def cmd_predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = str(update.effective_user.id)
+    pred = engine.predict(uid)
+    if pred:
+        await update.message.reply_text(_pred_text(pred))
+    else:
+        await update.message.reply_text("❌ 数据不足，需要至少 2 条经期记录才能预测。")
 
-        elif cmd.startswith("period add"):
-            parts = cmd.split(None, 4)
-            if len(parts) >= 4:
-                uid = parts[2]
-                start = parts[3]
-                end = parts[4] if len(parts) > 4 else None
-                username = parts[5] if len(parts) > 5 else ""
-                ok = bot.add_period(uid, start, end, username)
-                print(f"  {'Added' if ok else 'Duplicate, skipped'}")
-            else:
-                print("  Usage: period add <user_id> <start> [end] [username]")
 
-        elif cmd.startswith("period del"):
-            parts = cmd.split(None, 3)
-            if len(parts) >= 4:
-                ok = bot.del_period(parts[2], parts[3])
-                print(f"  {'Deleted' if ok else 'Not found'}")
-            else:
-                print("  Usage: period del <user_id> <start>")
-
-        elif cmd.startswith("period list"):
-            parts = cmd.split(None, 2)
-            uid = parts[2] if len(parts) > 2 else None
-            rows = bot.list_periods(uid)
-            if rows:
-                for uid, uname, p in rows:
-                    print(f"  {uid} {uname:<12s} {p['start']} → {p['end']}  [{p.get('confidence','')}]")
-            else:
-                print("  No periods recorded")
-
-        elif cmd == "export":
-            csv_str = bot.export_csv()
-            path = "period_export.csv"
-            with open(path, "w", encoding="utf-8", newline="") as f:
-                f.write(csv_str)
-            print(f"  Exported to {path} ({len(csv_str)} bytes)")
-
-        elif cmd == "stats":
-            users = bot.periods.get("users", {})
-            if not users:
-                print("  No users recorded")
-            for uid, u in users.items():
-                name = u.get("username", uid)
-                count = len(u.get("periods", []))
-                pred = bot.predict(uid)
-                if pred:
-                    print(f"  {name} ({uid}): {count} periods, "
-                          f"cycle ~{pred['avg_cycle_days']}d, "
-                          f"next ~{pred['next_period_start']}")
-                else:
-                    print(f"  {name} ({uid}): {count} periods (need >=2 for prediction)")
-
-        elif cmd.startswith("reminders"):
-            parts = cmd.split(None, 1)
-            date = parts[1] if len(parts) > 1 else None
-            reminders = bot.get_reminders(date)
-            if reminders:
-                for r in reminders:
-                    print(f"  {r['message']}")
-            else:
-                print("  No reminders")
-
-        elif cmd.startswith("fire"):
-            parts = cmd.split(None, 1)
-            date = parts[1] if len(parts) > 1 else None
-            bot.fire_reminders(date)
-
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    users = engine.periods.get("users", {})
+    if not users:
+        await update.message.reply_text("还没有任何用户数据。")
+        return
+    lines = ["📊 数据概览"]
+    for uid, u in users.items():
+        name = u.get("username", uid)
+        count = len(u.get("periods", []))
+        pred = engine.predict(uid)
+        if pred:
+            lines.append(f"  • {name}: {count} 次, 周期 ~{pred['avg_cycle_days']}d, 下次 ~{pred['next_period_start']}")
         else:
-            print("  Unknown command")
+            lines.append(f"  • {name}: {count} 次 (暂无预测)")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def cmd_remind(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    reminders = engine.get_reminders()
+    if reminders:
+        for r in reminders:
+            await update.message.reply_text(r["message"])
+    else:
+        await update.message.reply_text("✅ 今天没有任何预测提醒。")
+
+
+async def cmd_flush(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    before = engine.buffer["char_count"]
+    new_periods = engine.flush()
+    await update.message.reply_text(
+        f"📤 已分析缓冲区 ({before} 字符)，发现 {len(new_periods)} 条新记录。"
+    )
+
+
+def main():
+    token = engine.config.get("bot_token")
+    if not token:
+        log.error("bot_token 未配置")
+        return
+
+    app = Application.builder().token(token).build()
+
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("predict", cmd_predict))
+    app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("remind", cmd_remind))
+    app.add_handler(CommandHandler("flush", cmd_flush))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+
+    log.info("Mahouki Predict bot started")
+    app.run_polling()
 
 
 if __name__ == "__main__":
-    cli()
+    main()

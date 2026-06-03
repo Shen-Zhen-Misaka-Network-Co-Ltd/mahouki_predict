@@ -2,5 +2,6 @@
   "api_key": "",
   "api_url": "https://api.openai.com/v1/chat/completions",
   "model": "gpt-4o-mini",
-  "buffer_size": 10000
+  "buffer_size": 10000,
+  "bot_token": ""
 }
